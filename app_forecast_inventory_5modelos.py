@@ -24,17 +24,21 @@ st.set_page_config(
 
 st.title("📦 Framework de Optimización de Inventarios")
 st.caption(
-    "Pronóstico mensual + selección automática del mejor método por producto + comparación económica 2025 + pronóstico 2026"
+    "Pronóstico mensual + selección automática del mejor método por producto + comparación económica 2025 + pronóstico completo 2026"
 )
 
-# Modelos recomendados para tu caso: pocos meses, muchos SKU, demanda farmacéutica variable
-METODOS_PRONOSTICO = [
+# Modelos recomendados para tu caso: muchos SKU, demanda farmacéutica variable
+METODOS_PRONOSTICO_BASE = [
     "Promedio móvil",
     "SES",
     "Holt",
     "ARIMA",
     "Croston",
 ]
+
+# Croston solo debe competir si la demanda es intermitente.
+# Si menos del 30% de meses son cero, Croston se descarta para ese SKU.
+UMBRAL_CEROS_CROSTON = 0.30
 
 
 # =========================================================
@@ -97,9 +101,9 @@ def generar_demanda_sintetica(n_productos: int = 5, meses: int = 36, seed: int =
 
         ventas_lst.append(pd.DataFrame({"date": fechas, "product_id": producto, "demand_real": demanda}))
 
-        fcst_2025 = demanda[:12] * rng.uniform(0.75, 1.25, min(12, len(demanda)))
+        fcst_2025 = demanda[12:24] * rng.uniform(0.75, 1.25, min(12, max(0, len(demanda) - 12)))
         fcst_lst.append(pd.DataFrame({
-            "date": pd.date_range(start="2025-01-01", periods=min(12, len(fcst_2025)), freq="MS"),
+            "date": pd.date_range(start="2025-01-01", periods=len(fcst_2025), freq="MS"),
             "product_id": producto,
             "forecast_company": np.maximum(0, np.round(fcst_2025)),
         }))
@@ -275,6 +279,21 @@ def forecast_croston(serie: np.ndarray, pasos_futuros: int = 0, alpha: float = 0
     return asegurar_prediccion_valida(pred_hist, serie), np.maximum(0, pred_future)
 
 
+def metodos_permitidos_para_serie(serie: np.ndarray) -> list[str]:
+    """Evita que Croston gane en SKU de demanda continua."""
+    serie = np.asarray(serie, dtype=float)
+    if len(serie) == 0:
+        return ["SES"]
+
+    porcentaje_ceros = np.mean(serie <= 0)
+    metodos = [m for m in METODOS_PRONOSTICO_BASE if m != "Croston"]
+
+    if porcentaje_ceros >= UMBRAL_CEROS_CROSTON:
+        metodos.append("Croston")
+
+    return metodos
+
+
 def aplicar_metodo_pronostico(serie: np.ndarray, metodo: str, pasos_futuros: int = 0) -> tuple[np.ndarray, np.ndarray]:
     if metodo == "Promedio móvil":
         return forecast_promedio_movil(serie, pasos_futuros)
@@ -304,81 +323,94 @@ def calcular_errores(y_real, y_pred) -> dict:
     return {"wMAPE": wmape, "Bias": bias, "MAE": mae}
 
 
-def calcular_meses_futuros(df: pd.DataFrame, fecha_fin) -> tuple[int, pd.Timestamp]:
-    ultima_fecha = pd.to_datetime(df["date"].max()).to_period("M").to_timestamp()
-    fecha_fin = pd.to_datetime(fecha_fin).to_period("M").to_timestamp()
-
-    if fecha_fin <= ultima_fecha:
-        return 0, ultima_fecha
-
-    meses = (fecha_fin.year - ultima_fecha.year) * 12 + (fecha_fin.month - ultima_fecha.month)
-    return int(meses), fecha_fin
+def meses_entre(inicio: pd.Timestamp, fin: pd.Timestamp) -> int:
+    inicio = pd.to_datetime(inicio).to_period("M").to_timestamp()
+    fin = pd.to_datetime(fin).to_period("M").to_timestamp()
+    if fin < inicio:
+        return 0
+    return (fin.year - inicio.year) * 12 + (fin.month - inicio.month) + 1
 
 
 def generar_fechas_futuras(ultima_fecha, pasos_futuros: int) -> pd.DatetimeIndex:
     if pasos_futuros <= 0:
         return pd.DatetimeIndex([])
     ultima_fecha = pd.to_datetime(ultima_fecha).to_period("M").to_timestamp()
-    return pd.date_range(
-        start=ultima_fecha + pd.offsets.MonthBegin(1),
-        periods=pasos_futuros,
-        freq="MS",
-    )
+    return pd.date_range(start=ultima_fecha + pd.offsets.MonthBegin(1), periods=pasos_futuros, freq="MS")
 
 
 def generar_forecast(df: pd.DataFrame, metodo: str, fecha_fin_pronostico=None) -> pd.DataFrame:
+    """Modo manual. Usa histórico hasta 2025 para proyectar 2026 completo."""
     resultados = []
-    pasos_futuros, _ = calcular_meses_futuros(df, fecha_fin_pronostico) if fecha_fin_pronostico is not None else (0, None)
+    fecha_fin_pronostico = pd.to_datetime(fecha_fin_pronostico).to_period("M").to_timestamp()
 
     for producto, sub in df.groupby("product_id"):
         sub = sub.sort_values("date").copy()
-        serie = sub["demand_real"].to_numpy(dtype=float)
-        pred_hist, pred_future = aplicar_metodo_pronostico(serie, metodo, pasos_futuros)
-        err = calcular_errores(serie, pred_hist)
+        sub_hist_modelo = sub[sub["date"].dt.year <= 2025].copy()
+        if sub_hist_modelo.empty:
+            continue
 
-        sub["demand_forecast"] = np.round(pred_hist, 2)
-        sub["method_used"] = metodo
-        sub["method_wmape"] = err["wMAPE"]
-        sub["method_bias"] = err["Bias"]
-        sub["tipo_periodo"] = "Histórico"
-        resultados.append(sub)
+        serie = sub_hist_modelo["demand_real"].to_numpy(dtype=float)
+        _, pred_future = aplicar_metodo_pronostico(serie, metodo, 12)
 
-        if pasos_futuros > 0:
-            fechas_futuras = generar_fechas_futuras(sub["date"].max(), pasos_futuros)
-            futuro = pd.DataFrame(
-                {
-                    "date": fechas_futuras,
-                    "product_id": producto,
-                    "demand_real": np.round(pred_future, 2),
-                    "demand_forecast": np.round(pred_future, 2),
-                    "method_used": metodo,
-                    "method_wmape": err["wMAPE"],
-                    "method_bias": err["Bias"],
-                    "tipo_periodo": "Pronóstico futuro",
-                }
-            )
-            resultados.append(futuro)
+        sub_hist_modelo["demand_forecast"] = np.nan
+        sub_hist_modelo["method_used"] = metodo
+        sub_hist_modelo["method_wmape"] = np.nan
+        sub_hist_modelo["method_bias"] = np.nan
+        sub_hist_modelo["tipo_periodo"] = "Histórico"
+        resultados.append(sub_hist_modelo)
+
+        fechas_futuras = pd.date_range(start="2026-01-01", end=fecha_fin_pronostico, freq="MS")
+        pred_future = pred_future[:len(fechas_futuras)]
+        futuro = pd.DataFrame({
+            "date": fechas_futuras,
+            "product_id": producto,
+            "demand_real": np.round(pred_future, 2),
+            "demand_forecast": np.round(pred_future, 2),
+            "method_used": metodo,
+            "method_wmape": np.nan,
+            "method_bias": np.nan,
+            "tipo_periodo": "Pronóstico futuro",
+        })
+        resultados.append(futuro)
 
     return pd.concat(resultados, ignore_index=True)
 
 
 def generar_forecast_mejor_por_producto(df: pd.DataFrame, fecha_fin_pronostico=None):
+    """
+    Lógica corregida:
+    - Entrena con datos anteriores a 2025, normalmente 2024.
+    - Valida contra ventas reales 2025 para elegir el mejor método por SKU.
+    - Para proyectar 2026, reentrena con 2024+2025 y genera ene-dic 2026.
+    - Si hay ventas reales parciales de 2026 en el Excel, no se usan para entrenar ni para graficar el forecast futuro.
+    """
     forecasts_finales = []
     comparacion = []
-    pasos_futuros, _ = calcular_meses_futuros(df, fecha_fin_pronostico) if fecha_fin_pronostico is not None else (0, None)
+    fecha_fin_pronostico = pd.to_datetime(fecha_fin_pronostico).to_period("M").to_timestamp()
+    fechas_2026 = pd.date_range(start="2026-01-01", end=fecha_fin_pronostico, freq="MS")
 
     for producto, sub in df.groupby("product_id"):
         sub = sub.sort_values("date").copy()
-        serie = sub["demand_real"].to_numpy(dtype=float)
-        predicciones_hist = {}
-        predicciones_future = {}
+        train = sub[sub["date"].dt.year < 2025].copy()
+        valid = sub[sub["date"].dt.year == 2025].copy()
+        hist_para_2026 = sub[sub["date"].dt.year <= 2025].copy()
+
+        # Necesitamos 2024 y 2025 para validar. Si no hay suficiente, no se evalúa ese SKU.
+        if len(train) < 3 or len(valid) < 3 or hist_para_2026.empty:
+            continue
+
+        serie_train = train["demand_real"].to_numpy(dtype=float)
+        serie_valid = valid["demand_real"].to_numpy(dtype=float)
+        metodos = metodos_permitidos_para_serie(serie_train)
+
+        predicciones_validacion = {}
         filas_producto = []
 
-        for metodo in METODOS_PRONOSTICO:
-            pred_hist, pred_future = aplicar_metodo_pronostico(serie, metodo, pasos_futuros)
-            predicciones_hist[metodo] = pred_hist
-            predicciones_future[metodo] = pred_future
-            err = calcular_errores(serie, pred_hist)
+        for metodo in metodos:
+            _, pred_2025 = aplicar_metodo_pronostico(serie_train, metodo, len(serie_valid))
+            pred_2025 = pred_2025[:len(serie_valid)]
+            predicciones_validacion[metodo] = pred_2025
+            err = calcular_errores(serie_valid, pred_2025)
 
             fila = {
                 "Producto": producto,
@@ -391,34 +423,44 @@ def generar_forecast_mejor_por_producto(df: pd.DataFrame, fecha_fin_pronostico=N
             comparacion.append(fila)
             filas_producto.append(fila)
 
+        if not filas_producto:
+            continue
+
         comp_producto = pd.DataFrame(filas_producto)
         mejor_fila = comp_producto.sort_values(["wMAPE", "Abs_Bias", "MAE"]).iloc[0]
         mejor_metodo = mejor_fila["Método"]
 
-        sub["demand_forecast"] = np.round(predicciones_hist[mejor_metodo], 2)
-        sub["method_used"] = mejor_metodo
-        sub["method_wmape"] = float(mejor_fila["wMAPE"])
-        sub["method_bias"] = float(mejor_fila["Bias"])
-        sub["tipo_periodo"] = "Histórico"
-        forecasts_finales.append(sub)
+        # Histórico 2024+2025. Solo 2025 tiene forecast propuesto comparable.
+        hist = hist_para_2026.copy()
+        hist["demand_forecast"] = np.nan
+        hist.loc[hist["date"].dt.year == 2025, "demand_forecast"] = np.round(predicciones_validacion[mejor_metodo], 2)
+        hist["method_used"] = mejor_metodo
+        hist["method_wmape"] = float(mejor_fila["wMAPE"])
+        hist["method_bias"] = float(mejor_fila["Bias"])
+        hist["tipo_periodo"] = "Histórico"
+        forecasts_finales.append(hist)
 
-        if pasos_futuros > 0:
-            fechas_futuras = generar_fechas_futuras(sub["date"].max(), pasos_futuros)
-            futuro = pd.DataFrame(
-                {
-                    "date": fechas_futuras,
-                    "product_id": producto,
-                    "demand_real": np.round(predicciones_future[mejor_metodo], 2),
-                    "demand_forecast": np.round(predicciones_future[mejor_metodo], 2),
-                    "method_used": mejor_metodo,
-                    "method_wmape": float(mejor_fila["wMAPE"]),
-                    "method_bias": float(mejor_fila["Bias"]),
-                    "tipo_periodo": "Pronóstico futuro",
-                }
-            )
-            forecasts_finales.append(futuro)
+        # Forecast 2026 completo usando 2024+2025 y el mejor método elegido.
+        serie_2024_2025 = hist_para_2026["demand_real"].to_numpy(dtype=float)
+        _, pred_2026 = aplicar_metodo_pronostico(serie_2024_2025, mejor_metodo, len(fechas_2026))
+        pred_2026 = pred_2026[:len(fechas_2026)]
+
+        futuro = pd.DataFrame({
+            "date": fechas_2026,
+            "product_id": producto,
+            "demand_real": np.round(pred_2026, 2),
+            "demand_forecast": np.round(pred_2026, 2),
+            "method_used": mejor_metodo,
+            "method_wmape": float(mejor_fila["wMAPE"]),
+            "method_bias": float(mejor_fila["Bias"]),
+            "tipo_periodo": "Pronóstico futuro",
+        })
+        forecasts_finales.append(futuro)
 
     df_comparacion = pd.DataFrame(comparacion)
+    if df_comparacion.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
     mejores = (
         df_comparacion.sort_values(["Producto", "wMAPE", "Abs_Bias", "MAE"])
         .groupby("Producto", as_index=False)
@@ -530,7 +572,7 @@ def simular_producto(df_producto: pd.DataFrame, politica: str, p: ParametrosInve
     pipeline = {}
     resultados = []
 
-    demanda_promedio_mensual = max(0.01, df_producto["demand_forecast"].mean())
+    demanda_promedio_mensual = max(0.01, df_producto["demand_forecast"].fillna(df_producto["demand_real"]).mean())
 
     for t, fila in df_producto.iterrows():
         llegada = pipeline.pop(t, 0)
@@ -567,25 +609,23 @@ def simular_producto(df_producto: pd.DataFrame, politica: str, p: ParametrosInve
         venta_perdida = max(0, demanda_real - stock_fisico)
         stock_fisico -= venta_real
 
-        resultados.append(
-            {
-                "date": fila["date"],
-                "product_id": fila["product_id"],
-                "method_used": fila.get("method_used", ""),
-                "tipo_periodo": fila.get("tipo_periodo", ""),
-                "demand_real": demanda_real,
-                "demand_forecast": fila["demand_forecast"],
-                "inventory_level": stock_fisico,
-                "inventory_position": posicion_inventario,
-                "order_placed": orden,
-                "arrivals": llegada,
-                "sales_real": venta_real,
-                "sales_lost": venta_perdida,
-                "reorder_point_s": punto_reorden,
-                "target_level_S": nivel_objetivo,
-                "is_stockout": int(venta_perdida > 0),
-            }
-        )
+        resultados.append({
+            "date": fila["date"],
+            "product_id": fila["product_id"],
+            "method_used": fila.get("method_used", ""),
+            "tipo_periodo": fila.get("tipo_periodo", ""),
+            "demand_real": demanda_real,
+            "demand_forecast": fila["demand_forecast"],
+            "inventory_level": stock_fisico,
+            "inventory_position": posicion_inventario,
+            "order_placed": orden,
+            "arrivals": llegada,
+            "sales_real": venta_real,
+            "sales_lost": venta_perdida,
+            "reorder_point_s": punto_reorden,
+            "target_level_S": nivel_objetivo,
+            "is_stockout": int(venta_perdida > 0),
+        })
 
     return pd.DataFrame(resultados)
 
@@ -647,10 +687,13 @@ def grafico_forecast(df_producto: pd.DataFrame) -> go.Figure:
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df_hist["date"], y=df_hist["demand_real"], mode="lines+markers", name="Demanda real mensual histórica"))
-    fig.add_trace(go.Scatter(x=df_hist["date"], y=df_hist["demand_forecast"], mode="lines+markers", name=f"Ajuste del pronóstico ({metodo})"))
+
+    df_ajuste = df_hist[df_hist["demand_forecast"].notna()].copy()
+    if not df_ajuste.empty:
+        fig.add_trace(go.Scatter(x=df_ajuste["date"], y=df_ajuste["demand_forecast"], mode="lines+markers", name=f"Pronóstico propuesto validación 2025 ({metodo})"))
 
     if not df_future.empty:
-        fig.add_trace(go.Scatter(x=df_future["date"], y=df_future["demand_forecast"], mode="lines+markers", name=f"Pronóstico futuro ({metodo})", line={"dash": "dash"}))
+        fig.add_trace(go.Scatter(x=df_future["date"], y=df_future["demand_forecast"], mode="lines+markers", name=f"Pronóstico futuro 2026 ({metodo})", line={"dash": "dash"}))
 
     fig.update_layout(
         title=f"Demanda mensual histórica y pronóstico futuro - Método usado: {metodo}",
@@ -665,7 +708,7 @@ def grafico_comparacion_2025(detalle_prod: pd.DataFrame, producto: str) -> go.Fi
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=detalle_prod["date"], y=detalle_prod["demand_real"], mode="lines+markers", name="Ventas reales 2025"))
     fig.add_trace(go.Scatter(x=detalle_prod["date"], y=detalle_prod["forecast_company"], mode="lines+markers", name="Forecast empresa 2025"))
-    fig.add_trace(go.Scatter(x=detalle_prod["date"], y=detalle_prod["demand_forecast"], mode="lines+markers", name="Forecast propuesto"))
+    fig.add_trace(go.Scatter(x=detalle_prod["date"], y=detalle_prod["demand_forecast"], mode="lines+markers", name="Forecast propuesto 2025"))
     fig.update_layout(
         title=f"Ventas reales vs forecast empresa vs propuesta - {producto}",
         xaxis_title="Mes",
@@ -736,19 +779,30 @@ else:
 st.sidebar.header("2. Pronóstico mensual")
 modo_pronostico = st.sidebar.selectbox("Selección del método", ["Automático: mejor método por producto", "Manual: elegir un método"])
 
-ultima_fecha_historica = pd.to_datetime(df_real["date"].max()).to_period("M").to_timestamp()
 fecha_fin_pronostico = st.sidebar.date_input(
     "Pronosticar hasta",
     value=pd.Timestamp("2026-12-01"),
-    min_value=ultima_fecha_historica.date(),
+    min_value=pd.Timestamp("2026-01-01").date(),
 )
 fecha_fin_pronostico = pd.to_datetime(fecha_fin_pronostico).to_period("M").to_timestamp()
 
+# La selección de método se hace con 2024 -> validación 2025.
+# La proyección futura usa 2024+2025 para generar 2026 completo.
 df_forecast_auto, df_comparacion = generar_forecast_mejor_por_producto(df_real, fecha_fin_pronostico=fecha_fin_pronostico)
+
+if df_forecast_auto.empty or df_comparacion.empty:
+    st.warning(
+        "No se pudo generar forecast. Revisa que la hoja Ventas_Historicas tenga datos 2024 y 2025 por SKU. "
+        "La app usa 2024 para entrenar y 2025 para validar."
+    )
+    st.write("Años disponibles en ventas:", sorted(df_real["date"].dt.year.unique()))
+    st.dataframe(df_real.head(50), use_container_width=True)
+    st.stop()
+
 resumen_2025, detalle_2025 = calcular_comparacion_2025(df_forecast_auto, df_forecast_empresa, df_costos)
 
 if modo_pronostico == "Manual: elegir un método":
-    metodo_manual = st.sidebar.selectbox("Método manual", METODOS_PRONOSTICO)
+    metodo_manual = st.sidebar.selectbox("Método manual", METODOS_PRONOSTICO_BASE)
     df_forecast = generar_forecast(df_real, metodo_manual, fecha_fin_pronostico=fecha_fin_pronostico)
 else:
     metodo_manual = None
@@ -850,7 +904,8 @@ with tab1:
     st.subheader("Mejor método de pronóstico por producto")
     st.write(
         "La app compara Promedio móvil, SES, Holt, ARIMA y Croston para cada producto. "
-        "El mejor método se elige por menor wMAPE. Si hay empate, se toma el Bias más cercano a cero y luego el MAE más bajo."
+        "Croston solo compite si el SKU presenta demanda intermitente. "
+        "El mejor método se elige por menor wMAPE; si hay empate, se toma el Bias más cercano a cero y luego el MAE más bajo."
     )
 
     resumen_mejores = df_comparacion[df_comparacion["Es mejor"]].copy().sort_values("Producto")
@@ -874,8 +929,8 @@ with tab1:
 with tab2:
     st.subheader("Pronóstico mensual de demanda")
     st.write(
-        "La demanda se trabaja por mes. Si cargaste datos diarios, el sistema los sumó automáticamente por producto y mes. "
-        "Además, la app proyecta meses futuros hasta la fecha indicada en el menú lateral."
+        "La app usa 2024 como entrenamiento, valida el modelo contra 2025 y luego proyecta el 2026 completo usando 2024+2025. "
+        "Si tu Excel trae ventas parciales de 2026, no se usan para entrenar el forecast futuro, porque el objetivo es proyectar todo 2026."
     )
 
     col_a, col_b = st.columns([2, 1])
