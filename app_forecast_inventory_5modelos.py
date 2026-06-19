@@ -1,3 +1,4 @@
+
 import math
 import warnings
 from dataclasses import dataclass
@@ -36,9 +37,18 @@ METODOS_PRONOSTICO_BASE = [
     "Croston",
 ]
 
-# Croston solo debe competir si la demanda es intermitente.
-# Si menos del 30% de meses son cero, Croston se descarta para ese SKU.
+# Croston solo compite si el SKU tiene demanda intermitente.
 UMBRAL_CEROS_CROSTON = 0.30
+
+# Si dos modelos tienen wMAPE casi igual, se prioriza el modelo con mayor capacidad de representar dinámica.
+TOLERANCIA_WMAPE = 0.02
+PRIORIDAD_MODELOS = {
+    "ARIMA": 1,
+    "Holt": 2,
+    "SES": 3,
+    "Promedio móvil": 4,
+    "Croston": 5,
+}
 
 
 # =========================================================
@@ -323,54 +333,83 @@ def calcular_errores(y_real, y_pred) -> dict:
     return {"wMAPE": wmape, "Bias": bias, "MAE": mae}
 
 
-def meses_entre(inicio: pd.Timestamp, fin: pd.Timestamp) -> int:
-    inicio = pd.to_datetime(inicio).to_period("M").to_timestamp()
-    fin = pd.to_datetime(fin).to_period("M").to_timestamp()
-    if fin < inicio:
-        return 0
-    return (fin.year - inicio.year) * 12 + (fin.month - inicio.month) + 1
+def elegir_mejor_modelo(comp_producto: pd.DataFrame) -> pd.Series:
+    """Elige por wMAPE, pero si hay modelos muy cercanos prioriza ARIMA > Holt > SES > MA > Croston."""
+    comp = comp_producto.copy()
+    if comp.empty:
+        return pd.Series(dtype=object)
+
+    mejor_wmape = comp["wMAPE"].min()
+    candidatos = comp[comp["wMAPE"] <= mejor_wmape + TOLERANCIA_WMAPE].copy()
+    candidatos["Prioridad"] = candidatos["Método"].map(PRIORIDAD_MODELOS).fillna(99)
+    candidatos = candidatos.sort_values(["Prioridad", "Abs_Bias", "MAE", "wMAPE"])
+    return candidatos.iloc[0]
 
 
-def generar_fechas_futuras(ultima_fecha, pasos_futuros: int) -> pd.DatetimeIndex:
-    if pasos_futuros <= 0:
-        return pd.DatetimeIndex([])
-    ultima_fecha = pd.to_datetime(ultima_fecha).to_period("M").to_timestamp()
-    return pd.date_range(start=ultima_fecha + pd.offsets.MonthBegin(1), periods=pasos_futuros, freq="MS")
+def generar_forecast_2026_rolling(serie_hasta_2025: np.ndarray, reales_2026: pd.DataFrame, metodo: str) -> pd.DataFrame:
+    """
+    Genera enero-diciembre 2026.
+    Si existen ventas reales parciales 2026, usa los meses previos de 2026 para entrenar los meses siguientes.
+    Ejemplo: febrero 2026 puede usar enero 2026 real; marzo puede usar enero-febrero real.
+    Para meses sin real disponible, usa los pronósticos anteriores de 2026 de forma recursiva.
+    """
+    fechas_2026 = pd.date_range(start="2026-01-01", end="2026-12-01", freq="MS")
+    reales_dict = {
+        pd.to_datetime(r["date"]).to_period("M").to_timestamp(): float(r["demand_real"])
+        for _, r in reales_2026.iterrows()
+    }
+
+    historial = list(np.asarray(serie_hasta_2025, dtype=float))
+    filas = []
+
+    for fecha in fechas_2026:
+        _, pred = aplicar_metodo_pronostico(np.asarray(historial, dtype=float), metodo, 1)
+        forecast_mes = float(pred[0]) if len(pred) else 0.0
+        real_mes = reales_dict.get(fecha, np.nan)
+
+        filas.append({
+            "date": fecha,
+            "demand_real": real_mes,
+            "demand_forecast": round(forecast_mes, 2),
+            "tipo_periodo": "Pronóstico futuro",
+        })
+
+        if not pd.isna(real_mes):
+            historial.append(real_mes)
+        else:
+            historial.append(forecast_mes)
+
+    return pd.DataFrame(filas)
 
 
 def generar_forecast(df: pd.DataFrame, metodo: str, fecha_fin_pronostico=None) -> pd.DataFrame:
-    """Modo manual. Usa histórico hasta 2025 para proyectar 2026 completo."""
+    """Modo manual. Ajusta 2024+2025, proyecta 2026 completo y usa 2026 disponible para actualizar meses posteriores."""
     resultados = []
-    fecha_fin_pronostico = pd.to_datetime(fecha_fin_pronostico).to_period("M").to_timestamp()
 
     for producto, sub in df.groupby("product_id"):
         sub = sub.sort_values("date").copy()
-        sub_hist_modelo = sub[sub["date"].dt.year <= 2025].copy()
-        if sub_hist_modelo.empty:
+        hist_2024_2025 = sub[sub["date"].dt.year <= 2025].copy()
+        reales_2026 = sub[sub["date"].dt.year == 2026].copy()
+
+        if hist_2024_2025.empty:
             continue
 
-        serie = sub_hist_modelo["demand_real"].to_numpy(dtype=float)
-        _, pred_future = aplicar_metodo_pronostico(serie, metodo, 12)
+        serie = hist_2024_2025["demand_real"].to_numpy(dtype=float)
+        pred_hist, _ = aplicar_metodo_pronostico(serie, metodo, 0)
 
-        sub_hist_modelo["demand_forecast"] = np.nan
-        sub_hist_modelo["method_used"] = metodo
-        sub_hist_modelo["method_wmape"] = np.nan
-        sub_hist_modelo["method_bias"] = np.nan
-        sub_hist_modelo["tipo_periodo"] = "Histórico"
-        resultados.append(sub_hist_modelo)
+        hist_2024_2025["demand_forecast"] = np.round(pred_hist, 2)
+        hist_2024_2025.loc[hist_2024_2025["date"].dt.year == 2024, "demand_forecast"] = np.nan
+        hist_2024_2025["method_used"] = metodo
+        hist_2024_2025["method_wmape"] = np.nan
+        hist_2024_2025["method_bias"] = np.nan
+        hist_2024_2025["tipo_periodo"] = "Histórico"
+        resultados.append(hist_2024_2025)
 
-        fechas_futuras = pd.date_range(start="2026-01-01", end=fecha_fin_pronostico, freq="MS")
-        pred_future = pred_future[:len(fechas_futuras)]
-        futuro = pd.DataFrame({
-            "date": fechas_futuras,
-            "product_id": producto,
-            "demand_real": np.round(pred_future, 2),
-            "demand_forecast": np.round(pred_future, 2),
-            "method_used": metodo,
-            "method_wmape": np.nan,
-            "method_bias": np.nan,
-            "tipo_periodo": "Pronóstico futuro",
-        })
+        futuro = generar_forecast_2026_rolling(serie, reales_2026, metodo)
+        futuro["product_id"] = producto
+        futuro["method_used"] = metodo
+        futuro["method_wmape"] = np.nan
+        futuro["method_bias"] = np.nan
         resultados.append(futuro)
 
     return pd.concat(resultados, ignore_index=True)
@@ -378,39 +417,42 @@ def generar_forecast(df: pd.DataFrame, metodo: str, fecha_fin_pronostico=None) -
 
 def generar_forecast_mejor_por_producto(df: pd.DataFrame, fecha_fin_pronostico=None):
     """
-    Lógica corregida:
-    - Entrena con datos anteriores a 2025, normalmente 2024.
-    - Valida contra ventas reales 2025 para elegir el mejor método por SKU.
-    - Para proyectar 2026, reentrena con 2024+2025 y genera ene-dic 2026.
-    - Si hay ventas reales parciales de 2026 en el Excel, no se usan para entrenar ni para graficar el forecast futuro.
+    Lógica solicitada:
+    - Para elegir el modelo y comparar 2025: ajusta modelos usando 2024+2025.
+    - La comparación económica 2025 se hace contra ventas reales 2025 y forecast empresa 2025.
+    - Para el pronóstico 2026: genera enero-diciembre 2026.
+    - Si existen ventas reales parciales de 2026, las usa para actualizar el entrenamiento de los meses siguientes.
+    - Croston solo compite en SKU con demanda intermitente.
     """
     forecasts_finales = []
     comparacion = []
-    fecha_fin_pronostico = pd.to_datetime(fecha_fin_pronostico).to_period("M").to_timestamp()
-    fechas_2026 = pd.date_range(start="2026-01-01", end=fecha_fin_pronostico, freq="MS")
 
     for producto, sub in df.groupby("product_id"):
         sub = sub.sort_values("date").copy()
-        train = sub[sub["date"].dt.year < 2025].copy()
-        valid = sub[sub["date"].dt.year == 2025].copy()
-        hist_para_2026 = sub[sub["date"].dt.year <= 2025].copy()
 
-        # Necesitamos 2024 y 2025 para validar. Si no hay suficiente, no se evalúa ese SKU.
-        if len(train) < 3 or len(valid) < 3 or hist_para_2026.empty:
+        hist_2024_2025 = sub[sub["date"].dt.year <= 2025].copy()
+        reales_2026 = sub[sub["date"].dt.year == 2026].copy()
+        valid_2025 = hist_2024_2025[hist_2024_2025["date"].dt.year == 2025].copy()
+
+        if len(hist_2024_2025) < 6 or len(valid_2025) < 3:
             continue
 
-        serie_train = train["demand_real"].to_numpy(dtype=float)
-        serie_valid = valid["demand_real"].to_numpy(dtype=float)
-        metodos = metodos_permitidos_para_serie(serie_train)
+        serie_hist = hist_2024_2025["demand_real"].to_numpy(dtype=float)
+        metodos = metodos_permitidos_para_serie(serie_hist)
 
-        predicciones_validacion = {}
+        predicciones_hist = {}
         filas_producto = []
 
+        mask_2025 = hist_2024_2025["date"].dt.year == 2025
+        y_2025 = hist_2024_2025.loc[mask_2025, "demand_real"].to_numpy(dtype=float)
+
         for metodo in metodos:
-            _, pred_2025 = aplicar_metodo_pronostico(serie_train, metodo, len(serie_valid))
-            pred_2025 = pred_2025[:len(serie_valid)]
-            predicciones_validacion[metodo] = pred_2025
-            err = calcular_errores(serie_valid, pred_2025)
+            pred_hist, _ = aplicar_metodo_pronostico(serie_hist, metodo, 0)
+            pred_hist = pred_hist[:len(serie_hist)]
+            predicciones_hist[metodo] = pred_hist
+
+            pred_2025 = pred_hist[mask_2025.to_numpy()]
+            err = calcular_errores(y_2025, pred_2025)
 
             fila = {
                 "Producto": producto,
@@ -427,34 +469,24 @@ def generar_forecast_mejor_por_producto(df: pd.DataFrame, fecha_fin_pronostico=N
             continue
 
         comp_producto = pd.DataFrame(filas_producto)
-        mejor_fila = comp_producto.sort_values(["wMAPE", "Abs_Bias", "MAE"]).iloc[0]
+        mejor_fila = elegir_mejor_modelo(comp_producto)
         mejor_metodo = mejor_fila["Método"]
 
-        # Histórico 2024+2025. Solo 2025 tiene forecast propuesto comparable.
-        hist = hist_para_2026.copy()
-        hist["demand_forecast"] = np.nan
-        hist.loc[hist["date"].dt.year == 2025, "demand_forecast"] = np.round(predicciones_validacion[mejor_metodo], 2)
+        hist = hist_2024_2025.copy()
+        hist["demand_forecast"] = np.round(predicciones_hist[mejor_metodo], 2)
+        hist.loc[hist["date"].dt.year == 2024, "demand_forecast"] = np.nan
         hist["method_used"] = mejor_metodo
         hist["method_wmape"] = float(mejor_fila["wMAPE"])
         hist["method_bias"] = float(mejor_fila["Bias"])
         hist["tipo_periodo"] = "Histórico"
         forecasts_finales.append(hist)
 
-        # Forecast 2026 completo usando 2024+2025 y el mejor método elegido.
-        serie_2024_2025 = hist_para_2026["demand_real"].to_numpy(dtype=float)
-        _, pred_2026 = aplicar_metodo_pronostico(serie_2024_2025, mejor_metodo, len(fechas_2026))
-        pred_2026 = pred_2026[:len(fechas_2026)]
-
-        futuro = pd.DataFrame({
-            "date": fechas_2026,
-            "product_id": producto,
-            "demand_real": np.round(pred_2026, 2),
-            "demand_forecast": np.round(pred_2026, 2),
-            "method_used": mejor_metodo,
-            "method_wmape": float(mejor_fila["wMAPE"]),
-            "method_bias": float(mejor_fila["Bias"]),
-            "tipo_periodo": "Pronóstico futuro",
-        })
+        # Forecast 2026 completo con actualización rolling usando ventas reales 2026 disponibles.
+        futuro = generar_forecast_2026_rolling(serie_hist, reales_2026, mejor_metodo)
+        futuro["product_id"] = producto
+        futuro["method_used"] = mejor_metodo
+        futuro["method_wmape"] = float(mejor_fila["wMAPE"])
+        futuro["method_bias"] = float(mejor_fila["Bias"])
         forecasts_finales.append(futuro)
 
     df_comparacion = pd.DataFrame(comparacion)
@@ -462,9 +494,9 @@ def generar_forecast_mejor_por_producto(df: pd.DataFrame, fecha_fin_pronostico=N
         return pd.DataFrame(), pd.DataFrame()
 
     mejores = (
-        df_comparacion.sort_values(["Producto", "wMAPE", "Abs_Bias", "MAE"])
-        .groupby("Producto", as_index=False)
-        .first()[["Producto", "Método"]]
+        df_comparacion.groupby("Producto", as_index=False)
+        .apply(lambda g: elegir_mejor_modelo(g)[["Producto", "Método"]])
+        .reset_index(drop=True)
         .rename(columns={"Método": "Mejor método"})
     )
 
@@ -532,6 +564,40 @@ def calcular_comparacion_2025(df_forecast_auto, df_forecast_empresa, df_costos):
     return resumen, df
 
 
+def calcular_validacion_2026(df_forecast_auto, df_costos):
+    df_2026 = df_forecast_auto[
+        (df_forecast_auto["tipo_periodo"] == "Pronóstico futuro")
+        & (df_forecast_auto["date"].dt.year == 2026)
+        & (df_forecast_auto["demand_real"].notna())
+    ].copy()
+
+    if df_2026.empty:
+        return pd.DataFrame()
+
+    df_2026 = df_2026.merge(df_costos, on="product_id", how="left")
+    df_2026["unit_cost"] = df_2026["unit_cost"].fillna(0)
+
+    filas = []
+    for producto, sub in df_2026.groupby("product_id"):
+        real = sub["demand_real"].to_numpy(dtype=float)
+        pred = sub["demand_forecast"].to_numpy(dtype=float)
+        costo = sub["unit_cost"].to_numpy(dtype=float)
+
+        err = calcular_errores(real, pred)
+        error_soles = np.sum(np.abs(pred - real) * costo)
+
+        filas.append({
+            "Producto": producto,
+            "Método": sub["method_used"].iloc[0],
+            "Meses reales 2026 usados": len(sub),
+            "wMAPE 2026 parcial": err["wMAPE"],
+            "Bias 2026 parcial": err["Bias"],
+            "Error valorizado 2026 parcial S/": error_soles,
+        })
+
+    return pd.DataFrame(filas)
+
+
 def formatear_resumen_2025(df_resumen: pd.DataFrame) -> pd.DataFrame:
     df = df_resumen.copy()
     for col in ["wMAPE empresa", "wMAPE propuesta", "Bias empresa", "Bias propuesta"]:
@@ -540,6 +606,16 @@ def formatear_resumen_2025(df_resumen: pd.DataFrame) -> pd.DataFrame:
         df[col] = df[col].map(lambda x: f"S/ {x:,.2f}")
     for col in ["Exceso empresa", "Faltante empresa", "Exceso propuesta", "Faltante propuesta"]:
         df[col] = df[col].map(lambda x: f"{x:,.0f}")
+    return df
+
+
+def formatear_validacion_2026(df_validacion: pd.DataFrame) -> pd.DataFrame:
+    df = df_validacion.copy()
+    if df.empty:
+        return df
+    for col in ["wMAPE 2026 parcial", "Bias 2026 parcial"]:
+        df[col] = df[col].map(lambda x: f"{x:.2%}")
+    df["Error valorizado 2026 parcial S/"] = df["Error valorizado 2026 parcial S/"].map(lambda x: f"S/ {x:,.2f}")
     return df
 
 
@@ -604,7 +680,7 @@ def simular_producto(df_producto: pd.DataFrame, politica: str, p: ParametrosInve
             mes_llegada = t + p.lead_time_months
             pipeline[mes_llegada] = pipeline.get(mes_llegada, 0) + orden
 
-        demanda_real = float(fila["demand_real"])
+        demanda_real = float(fila["demand_real"]) if not pd.isna(fila["demand_real"]) else float(fila["demand_forecast"])
         venta_real = min(stock_fisico, demanda_real)
         venta_perdida = max(0, demanda_real - stock_fisico)
         stock_fisico -= venta_real
@@ -690,10 +766,13 @@ def grafico_forecast(df_producto: pd.DataFrame) -> go.Figure:
 
     df_ajuste = df_hist[df_hist["demand_forecast"].notna()].copy()
     if not df_ajuste.empty:
-        fig.add_trace(go.Scatter(x=df_ajuste["date"], y=df_ajuste["demand_forecast"], mode="lines+markers", name=f"Pronóstico propuesto validación 2025 ({metodo})"))
+        fig.add_trace(go.Scatter(x=df_ajuste["date"], y=df_ajuste["demand_forecast"], mode="lines+markers", name=f"Pronóstico propuesto 2025 ({metodo})"))
 
     if not df_future.empty:
-        fig.add_trace(go.Scatter(x=df_future["date"], y=df_future["demand_forecast"], mode="lines+markers", name=f"Pronóstico futuro 2026 ({metodo})", line={"dash": "dash"}))
+        fig.add_trace(go.Scatter(x=df_future["date"], y=df_future["demand_forecast"], mode="lines+markers", name=f"Pronóstico 2026 completo ({metodo})", line={"dash": "dash"}))
+        df_future_real = df_future[df_future["demand_real"].notna()].copy()
+        if not df_future_real.empty:
+            fig.add_trace(go.Scatter(x=df_future_real["date"], y=df_future_real["demand_real"], mode="lines+markers", name="Venta real 2026 disponible", line={"dash": "dot"}))
 
     fig.update_layout(
         title=f"Demanda mensual histórica y pronóstico futuro - Método usado: {metodo}",
@@ -786,20 +865,18 @@ fecha_fin_pronostico = st.sidebar.date_input(
 )
 fecha_fin_pronostico = pd.to_datetime(fecha_fin_pronostico).to_period("M").to_timestamp()
 
-# La selección de método se hace con 2024 -> validación 2025.
-# La proyección futura usa 2024+2025 para generar 2026 completo.
 df_forecast_auto, df_comparacion = generar_forecast_mejor_por_producto(df_real, fecha_fin_pronostico=fecha_fin_pronostico)
 
 if df_forecast_auto.empty or df_comparacion.empty:
     st.warning(
-        "No se pudo generar forecast. Revisa que la hoja Ventas_Historicas tenga datos 2024 y 2025 por SKU. "
-        "La app usa 2024 para entrenar y 2025 para validar."
+        "No se pudo generar forecast. Revisa que la hoja Ventas_Historicas tenga al menos datos 2024 y 2025 por SKU."
     )
     st.write("Años disponibles en ventas:", sorted(df_real["date"].dt.year.unique()))
     st.dataframe(df_real.head(50), use_container_width=True)
     st.stop()
 
 resumen_2025, detalle_2025 = calcular_comparacion_2025(df_forecast_auto, df_forecast_empresa, df_costos)
+validacion_2026 = calcular_validacion_2026(df_forecast_auto, df_costos)
 
 if modo_pronostico == "Manual: elegir un método":
     metodo_manual = st.sidebar.selectbox("Método manual", METODOS_PRONOSTICO_BASE)
@@ -905,7 +982,7 @@ with tab1:
     st.write(
         "La app compara Promedio móvil, SES, Holt, ARIMA y Croston para cada producto. "
         "Croston solo compite si el SKU presenta demanda intermitente. "
-        "El mejor método se elige por menor wMAPE; si hay empate, se toma el Bias más cercano a cero y luego el MAE más bajo."
+        "Si dos modelos tienen wMAPE similar, se prioriza ARIMA > Holt > SES > Promedio móvil > Croston."
     )
 
     resumen_mejores = df_comparacion[df_comparacion["Es mejor"]].copy().sort_values("Producto")
@@ -929,8 +1006,9 @@ with tab1:
 with tab2:
     st.subheader("Pronóstico mensual de demanda")
     st.write(
-        "La app usa 2024 como entrenamiento, valida el modelo contra 2025 y luego proyecta el 2026 completo usando 2024+2025. "
-        "Si tu Excel trae ventas parciales de 2026, no se usan para entrenar el forecast futuro, porque el objetivo es proyectar todo 2026."
+        "La app ajusta los modelos con 2024+2025 para obtener el pronóstico propuesto 2025. "
+        "Luego genera el pronóstico completo de enero a diciembre 2026. "
+        "Si existen ventas reales parciales de 2026, las usa para actualizar meses posteriores y también las muestra como referencia."
     )
 
     col_a, col_b = st.columns([2, 1])
@@ -940,6 +1018,11 @@ with tab2:
         st.write(f"Comparación de métodos para {producto_sel}")
         st.dataframe(formatear_comparacion(sub_comparacion_producto), use_container_width=True, hide_index=True)
         st.success(f"Mejor método para {producto_sel}: {mejor_metodo_producto} con wMAPE {mejor_wmape_producto:.2%}.")
+
+        valid_sku = validacion_2026[validacion_2026["Producto"] == producto_sel].copy() if not validacion_2026.empty else pd.DataFrame()
+        if not valid_sku.empty:
+            st.write("Validación parcial 2026")
+            st.dataframe(formatear_validacion_2026(valid_sku), use_container_width=True, hide_index=True)
 
 with tab3:
     st.subheader("Comparación 2025: Empresa vs Forecast Propuesto")
@@ -1006,6 +1089,12 @@ with tab6:
     else:
         st.warning("No hay resumen económico 2025 disponible.")
 
+    st.write("Validación parcial 2026")
+    if not validacion_2026.empty:
+        st.dataframe(formatear_validacion_2026(validacion_2026), use_container_width=True, hide_index=True)
+    else:
+        st.info("No hay ventas reales 2026 disponibles para validar parcialmente.")
+
     st.write("Datos mensuales históricos y pronóstico futuro elegido")
     st.dataframe(sub_forecast, use_container_width=True, hide_index=True)
 
@@ -1024,3 +1113,7 @@ with tab6:
     if not resumen_2025.empty:
         csv_resumen = resumen_2025.to_csv(index=False).encode("utf-8")
         st.download_button("Descargar resumen económico 2025 en CSV", data=csv_resumen, file_name="resumen_economico_2025.csv", mime="text/csv")
+
+    if not validacion_2026.empty:
+        csv_val = validacion_2026.to_csv(index=False).encode("utf-8")
+        st.download_button("Descargar validación parcial 2026 en CSV", data=csv_val, file_name="validacion_parcial_2026.csv", mime="text/csv")
