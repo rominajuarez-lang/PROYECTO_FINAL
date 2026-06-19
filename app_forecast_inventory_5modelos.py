@@ -382,6 +382,7 @@ def generar_forecast_2026_rolling(serie_hasta_2025: np.ndarray, reales_2026: pd.
     return pd.DataFrame(filas)
 
 
+@st.cache_data(show_spinner="Generando pronóstico manual...")
 def generar_forecast(df: pd.DataFrame, metodo: str, fecha_fin_pronostico=None) -> pd.DataFrame:
     """Modo manual. Ajusta 2024+2025, proyecta 2026 completo y usa 2026 disponible para actualizar meses posteriores."""
     resultados = []
@@ -415,6 +416,7 @@ def generar_forecast(df: pd.DataFrame, metodo: str, fecha_fin_pronostico=None) -
     return pd.concat(resultados, ignore_index=True)
 
 
+@st.cache_data(show_spinner="Calculando mejores modelos por SKU...")
 def generar_forecast_mejor_por_producto(df: pd.DataFrame, fecha_fin_pronostico=None):
     """
     Lógica solicitada:
@@ -493,12 +495,17 @@ def generar_forecast_mejor_por_producto(df: pd.DataFrame, fecha_fin_pronostico=N
     if df_comparacion.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    mejores = (
-        df_comparacion.groupby("Producto", as_index=False)
-        .apply(lambda g: elegir_mejor_modelo(g)[["Producto", "Método"]])
-        .reset_index(drop=True)
-        .rename(columns={"Método": "Mejor método"})
-    )
+    # Evita error de pandas cuando groupby.apply devuelve una Series sin índice esperado.
+    mejores_lista = []
+    for producto_g, grupo in df_comparacion.groupby("Producto"):
+        mejor = elegir_mejor_modelo(grupo)
+        if not mejor.empty and "Método" in mejor.index:
+            mejores_lista.append({
+                "Producto": producto_g,
+                "Mejor método": mejor["Método"],
+            })
+
+    mejores = pd.DataFrame(mejores_lista)
 
     df_comparacion = df_comparacion.merge(mejores, on="Producto", how="left")
     df_comparacion["Es mejor"] = df_comparacion["Método"] == df_comparacion["Mejor método"]
@@ -510,6 +517,7 @@ def generar_forecast_mejor_por_producto(df: pd.DataFrame, fecha_fin_pronostico=N
 # =========================================================
 # COMPARACIÓN ECONÓMICA 2025
 # =========================================================
+@st.cache_data(show_spinner="Calculando comparación económica 2025...")
 def calcular_comparacion_2025(df_forecast_auto, df_forecast_empresa, df_costos):
     df_prop = df_forecast_auto[
         (df_forecast_auto["tipo_periodo"] == "Histórico")
@@ -564,6 +572,7 @@ def calcular_comparacion_2025(df_forecast_auto, df_forecast_empresa, df_costos):
     return resumen, df
 
 
+@st.cache_data(show_spinner="Calculando validación parcial 2026...")
 def calcular_validacion_2026(df_forecast_auto, df_costos):
     df_2026 = df_forecast_auto[
         (df_forecast_auto["tipo_periodo"] == "Pronóstico futuro")
